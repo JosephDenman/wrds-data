@@ -159,19 +159,25 @@ class TestVolumeValidation:
         assert (result["vol"] > 0).all()
 
 
-class TestBuildCRSPPipeline:
+class TestBuildCRSPPipelineV1:
+    """Tests for v1 (legacy) CRSP pipeline — all 7 corrections active."""
 
-    def test_builds_all_steps(self):
-        config = CRSPCorrectionConfig()
+    def test_builds_all_steps_v1(self):
+        config = CRSPCorrectionConfig(crsp_version="v1")
         steps = build_crsp_pipeline(config)
         assert len(steps) == 7
         step_names = [s.name for s in steps]
         assert "ShareCodeFilter" in step_names
+        assert "ExchangeCodeFilter" in step_names
+        assert "PriceSignCorrection" in step_names
         assert "DelistingAdjustment" in step_names
+        assert "PennyStockFilter" in step_names
+        assert "VolumeValidation" in step_names
         assert "MinimumHistoryFilter" in step_names
 
-    def test_disabling_steps(self):
+    def test_disabling_steps_v1(self):
         config = CRSPCorrectionConfig(
+            crsp_version="v1",
             share_code_filter=False,
             penny_stock_filter=False,
         )
@@ -180,8 +186,8 @@ class TestBuildCRSPPipeline:
         assert "ShareCodeFilter" not in step_names
         assert "PennyStockFilter" not in step_names
 
-    def test_pipeline_runs(self, synthetic_crsp_daily, synthetic_delisting):
-        config = CRSPCorrectionConfig(min_trading_days=100)
+    def test_pipeline_runs_v1(self, synthetic_crsp_daily, synthetic_delisting):
+        config = CRSPCorrectionConfig(crsp_version="v1", min_trading_days=100)
         steps = build_crsp_pipeline(config)
 
         # Inject delisting data
@@ -194,7 +200,69 @@ class TestBuildCRSPPipeline:
 
         # Should have removed ADR (10002), penny stock (10004), short history (10005)
         remaining_permnos = result["permno"].unique()
-        assert 10002 not in remaining_permnos  # ADR
+        assert 10002 not in remaining_permnos  # ADR (ShareCodeFilter)
         assert 10005 not in remaining_permnos  # Short history
         # 10001 and 10003 should remain
         assert 10001 in remaining_permnos
+
+
+class TestBuildCRSPPipelineV2:
+    """Tests for v2 (CIZ) CRSP pipeline — skips share/exchange/delisting steps."""
+
+    def test_builds_v2_steps(self):
+        """V2 pipeline should skip ShareCodeFilter, ExchangeCodeFilter, DelistingAdjustment."""
+        config = CRSPCorrectionConfig(crsp_version="v2")
+        steps = build_crsp_pipeline(config)
+        step_names = [s.name for s in steps]
+
+        # These 3 should be SKIPPED for v2 (handled in SQL JOIN)
+        assert "ShareCodeFilter" not in step_names
+        assert "ExchangeCodeFilter" not in step_names
+        assert "DelistingAdjustment" not in step_names
+
+        # These 4 should still be present
+        assert "PriceSignCorrection" in step_names
+        assert "PennyStockFilter" in step_names
+        assert "VolumeValidation" in step_names
+        assert "MinimumHistoryFilter" in step_names
+        assert len(steps) == 4
+
+    def test_v2_default(self):
+        """Default config should use v2."""
+        config = CRSPCorrectionConfig()
+        assert config.crsp_version == "v2"
+        steps = build_crsp_pipeline(config)
+        step_names = [s.name for s in steps]
+        assert "ShareCodeFilter" not in step_names
+        assert "DelistingAdjustment" not in step_names
+        assert len(steps) == 4
+
+    def test_v2_pipeline_runs(self, synthetic_crsp_daily):
+        """V2 pipeline should work without delisting data or shrcd/exchcd columns."""
+        config = CRSPCorrectionConfig(crsp_version="v2", min_trading_days=100)
+        steps = build_crsp_pipeline(config)
+
+        # No need to inject delisting data for v2
+        pipeline = CorrectionPipeline(steps)
+        result = pipeline.run(synthetic_crsp_daily)
+
+        # Price correction should have been applied
+        assert (result["prc"] >= 0).all()
+        # Short history filtered
+        assert 10005 not in result["permno"].unique()
+        # ADR still present (ShareCodeFilter skipped in v2 — SQL handles it)
+        assert 10002 in result["permno"].unique()
+
+    def test_v2_disabling_steps(self):
+        """Disabling steps in v2 config should work."""
+        config = CRSPCorrectionConfig(
+            crsp_version="v2",
+            penny_stock_filter=False,
+            min_history_filter=False,
+        )
+        steps = build_crsp_pipeline(config)
+        step_names = [s.name for s in steps]
+        assert "PennyStockFilter" not in step_names
+        assert "MinimumHistoryFilter" not in step_names
+        # Only PriceSignCorrection and VolumeValidation remain
+        assert len(steps) == 2

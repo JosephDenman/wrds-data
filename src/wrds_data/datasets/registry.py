@@ -43,7 +43,15 @@ class DatasetRegistry:
 
     @staticmethod
     def _register_builtins(registry: DatasetRegistry) -> None:
-        """Register all built-in dataset definitions."""
+        """
+        Register all built-in dataset definitions.
+
+        By default, registers CRSP v2 (CIZ) datasets which provide data
+        after Dec 2024. V1 (legacy) datasets remain importable for
+        backwards compatibility but are not registered by default.
+
+        Use ``set_crsp_version("v1")`` to switch to legacy tables.
+        """
         # Import here to avoid circular imports
         from wrds_data.datasets.ccm import CCM_LINK
         from wrds_data.datasets.compustat import (
@@ -51,22 +59,55 @@ class DatasetRegistry:
             COMPUSTAT_QUARTERLY,
         )
         from wrds_data.datasets.crsp import (
-            CRSP_DAILY,
-            CRSP_DELISTING,
-            CRSP_MONTHLY,
+            CRSP_DAILY_V2,
+            CRSP_MONTHLY_V2,
             CRSP_NAMES,
         )
 
         for dataset in [
-            CRSP_DAILY,
-            CRSP_MONTHLY,
-            CRSP_DELISTING,
+            CRSP_DAILY_V2,
+            CRSP_MONTHLY_V2,
+            # CRSP_NAMES is a reference/dimension table (ticker-PERMNO mapping,
+            # SIC codes, exchange codes). Needed for universe resolution and
+            # sector classification regardless of v1/v2.
             CRSP_NAMES,
             COMPUSTAT_ANNUAL,
             COMPUSTAT_QUARTERLY,
             CCM_LINK,
         ]:
             registry.register(dataset)
+
+    def set_crsp_version(self, version: str = "v2") -> None:
+        """
+        Switch CRSP dataset registrations between v1 (legacy) and v2 (CIZ).
+
+        Args:
+            version: "v1" for legacy tables (data through Dec 2024),
+                     "v2" for CIZ tables (data ongoing after Jan 2025).
+        """
+        from wrds_data.datasets.crsp import (
+            CRSP_DAILY,
+            CRSP_DAILY_V2,
+            CRSP_DELISTING,
+            CRSP_MONTHLY,
+            CRSP_MONTHLY_V2,
+            CRSP_NAMES,
+        )
+
+        if version == "v2":
+            self.register(CRSP_DAILY_V2)
+            self.register(CRSP_MONTHLY_V2)
+            self.register(CRSP_NAMES)
+            # Remove v1-only datasets if present (delisting returns are
+            # included in v2's DLYRET, so no separate table needed)
+            self._datasets.pop("crsp_delisting", None)
+        elif version == "v1":
+            self.register(CRSP_DAILY)
+            self.register(CRSP_MONTHLY)
+            self.register(CRSP_DELISTING)
+            self.register(CRSP_NAMES)
+        else:
+            raise ValueError(f"Unknown CRSP version: {version!r}. Use 'v1' or 'v2'.")
 
     def register(self, dataset: DatasetDefinition) -> None:
         """Register a dataset definition. Overwrites if name already exists."""

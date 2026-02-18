@@ -76,52 +76,65 @@ class WRDSBackend(DataBackend):
         Constructs a SELECT query from the dataset definition, applies
         filters and date range, then renames columns from WRDS names
         to canonical names.
+
+        If the dataset has a sql_template, uses that directly instead of
+        constructing SQL from column definitions. The template must use
+        :start_date and :end_date as named parameters.
         """
-        # Determine which WRDS columns to select
-        if columns is not None:
-            wrds_cols = [dataset.columns[c] for c in columns if c in dataset.columns]
-        else:
-            wrds_cols = dataset.wrds_columns
-
-        select_clause = ", ".join(wrds_cols)
-        sql = f"SELECT {select_clause} FROM {dataset.wrds_table}"
-
-        where_clauses: list[str] = []
         params: dict[str, Any] = {}
 
-        # Date range filter
-        if date_range is not None:
-            start_date, end_date = date_range
-            wrds_date_col = dataset.columns[dataset.date_column]
-            where_clauses.append(f"{wrds_date_col} >= :start_date")
-            where_clauses.append(f"{wrds_date_col} <= :end_date")
-            params["start_date"] = start_date
-            params["end_date"] = end_date
+        if dataset.sql_template:
+            # --- Template-based query (used for v2 CRSP with JOINs) ---
+            sql = dataset.sql_template
 
-        # Column-value filters
-        if filters:
-            for canonical_name, value in filters.items():
-                if canonical_name not in dataset.columns:
-                    logger.warning(
-                        f"Filter column '{canonical_name}' not in dataset "
-                        f"'{dataset.name}', skipping"
-                    )
-                    continue
-                wrds_col = dataset.columns[canonical_name]
-                param_name = f"filter_{canonical_name}"
-                if isinstance(value, (list, tuple, set)):
-                    placeholders = ", ".join(
-                        f":{param_name}_{i}" for i in range(len(value))
-                    )
-                    where_clauses.append(f"{wrds_col} IN ({placeholders})")
-                    for i, v in enumerate(value):
-                        params[f"{param_name}_{i}"] = v
-                else:
-                    where_clauses.append(f"{wrds_col} = :{param_name}")
-                    params[param_name] = value
+            if date_range is not None:
+                params["start_date"] = date_range[0]
+                params["end_date"] = date_range[1]
+        else:
+            # --- Auto-generated query from column definitions ---
+            if columns is not None:
+                wrds_cols = [dataset.columns[c] for c in columns if c in dataset.columns]
+            else:
+                wrds_cols = dataset.wrds_columns
 
-        if where_clauses:
-            sql += " WHERE " + " AND ".join(where_clauses)
+            select_clause = ", ".join(wrds_cols)
+            sql = f"SELECT {select_clause} FROM {dataset.wrds_table}"
+
+            where_clauses: list[str] = []
+
+            # Date range filter
+            if date_range is not None:
+                start_date, end_date = date_range
+                wrds_date_col = dataset.columns[dataset.date_column]
+                where_clauses.append(f"{wrds_date_col} >= :start_date")
+                where_clauses.append(f"{wrds_date_col} <= :end_date")
+                params["start_date"] = start_date
+                params["end_date"] = end_date
+
+            # Column-value filters
+            if filters:
+                for canonical_name, value in filters.items():
+                    if canonical_name not in dataset.columns:
+                        logger.warning(
+                            f"Filter column '{canonical_name}' not in dataset "
+                            f"'{dataset.name}', skipping"
+                        )
+                        continue
+                    wrds_col = dataset.columns[canonical_name]
+                    param_name = f"filter_{canonical_name}"
+                    if isinstance(value, (list, tuple, set)):
+                        placeholders = ", ".join(
+                            f":{param_name}_{i}" for i in range(len(value))
+                        )
+                        where_clauses.append(f"{wrds_col} IN ({placeholders})")
+                        for i, v in enumerate(value):
+                            params[f"{param_name}_{i}"] = v
+                    else:
+                        where_clauses.append(f"{wrds_col} = :{param_name}")
+                        params[param_name] = value
+
+            if where_clauses:
+                sql += " WHERE " + " AND ".join(where_clauses)
 
         # Execute with retry logic
         for attempt in range(1, self.MAX_RETRIES + 1):

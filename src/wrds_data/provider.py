@@ -348,6 +348,46 @@ class WRDSDataProvider:
         sampler = WRDSUniverseSampler(self, cfg)
         return sampler.sample(as_of=as_of, n_symbols=n_symbols, random_seed=random_seed)
 
+    def sample_universe_historical(
+        self,
+        start: date,
+        end: date,
+        n_symbols: int | None = None,
+        rebalance_frequency: str | None = None,
+        sampling_config: UniverseSamplingConfig | None = None,
+        random_seed: int | None = None,
+    ) -> list[str]:
+        """
+        Sample a survivorship-bias-free universe across a historical period.
+
+        Takes multiple point-in-time snapshots (quarterly, monthly, or annually)
+        of the CRSP universe throughout the training period and unions them.
+        Stocks that were delisted partway through the period are included from
+        the snapshots taken while they were still active.
+
+        Args:
+            start: Training period start date.
+            end: Training period end date.
+            n_symbols: Target symbols per snapshot.
+            rebalance_frequency: "quarterly", "monthly", or "annually".
+            sampling_config: Override default sampling configuration.
+            random_seed: Override random seed.
+
+        Returns:
+            List of ticker symbols (sorted, deduplicated).
+        """
+        from wrds_data.sampling import WRDSUniverseSampler
+
+        cfg = sampling_config or UniverseSamplingConfig()
+        sampler = WRDSUniverseSampler(self, cfg)
+        return sampler.sample_historical(
+            start=start,
+            end=end,
+            n_symbols=n_symbols,
+            rebalance_frequency=rebalance_frequency,
+            random_seed=random_seed,
+        )
+
     def sector_industry(
         self,
         symbols: list[str],

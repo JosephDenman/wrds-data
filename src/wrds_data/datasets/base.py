@@ -24,6 +24,14 @@ class DatasetDefinition:
         description: Human-readable description of the dataset.
         default_chunk_years: Number of years per chunk when downloading.
             Smaller values for large tables (daily data), larger for small tables.
+        sql_template: Optional raw SQL query template. When set, the backend
+            uses this instead of auto-generating SQL from columns/wrds_table.
+            Must use :start_date and :end_date as named parameters for date
+            range filtering. Column results are still renamed via wrds_to_canonical.
+            Used for v2 CRSP queries that require JOINs with stksecurityinfohist.
+        is_reference_table: If True, download the entire table without date
+            filtering. Used for dimension/lookup tables (e.g. crsp_names, ccm_link)
+            where the date_column represents a validity range, not observation dates.
     """
 
     name: str
@@ -33,6 +41,8 @@ class DatasetDefinition:
     columns: dict[str, str] = field(default_factory=dict)
     description: str = ""
     default_chunk_years: int = 1
+    sql_template: str = ""
+    is_reference_table: bool = False
 
     @property
     def wrds_columns(self) -> list[str]:

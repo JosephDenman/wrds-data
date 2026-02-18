@@ -19,22 +19,20 @@ Column mapping from CRSP to tft-finance expected format:
     tft-finance     CRSP field      Notes
     -----------     ----------      -----
     close           abs(PRC)        Price sign correction applied
-    high            ASKHI           Highest ask/trade price (proxy for daily high)
-    low             BIDLO           Lowest bid/trade price (proxy for daily low)
-    open            prev close      CRSP has NO open price — we use previous close
+    high            ASKHI           Highest ask/trade price
+    low             BIDLO           Lowest bid/trade price
+    open            OPENPRC         Opening price
     volume          VOL             Trading volume in shares
-    vwap            close           CRSP has NO VWAP — approximated as close
 
-Both 'open' and 'vwap' are honest approximations with documented limitations.
+All columns are required. Missing columns raise SchemaValidationError.
+Missing individual values are left as NaN (no proxy substitution).
 """
 
 from __future__ import annotations
 
-import warnings
 from datetime import date, datetime
 from typing import Dict, List
 
-import numpy as np
 import pandas as pd
 from loguru import logger
 
@@ -57,11 +55,11 @@ class WRDSDataSource:
         - get_sector_industry(symbols) → DataFrame
 
     The output DataFrame is indexed by date and has columns:
-    [open, high, low, close, volume, vwap]
-    """
+    [open, high, low, close, volume]
 
-    _open_warning_shown: bool = False
-    _vwap_warning_shown: bool = False
+    All columns come from real CRSP fields. Missing columns raise
+    SchemaValidationError; missing values remain NaN.
+    """
 
     def __init__(self, provider: WRDSDataProvider) -> None:
         self._provider = provider
@@ -83,12 +81,12 @@ class WRDSDataSource:
 
         Returns:
             DataFrame indexed by date with columns:
-            [open, high, low, close, volume, vwap]
+            [open, high, low, close, volume]
         """
         permno = self._resolve_ticker_cached(symbol)
         if permno is None:
             return pd.DataFrame(
-                columns=["open", "high", "low", "close", "volume", "vwap"]
+                columns=["open", "high", "low", "close", "volume"]
             )
 
         start = start_date.date() if isinstance(start_date, datetime) else start_date
@@ -104,12 +102,12 @@ class WRDSDataSource:
         except Exception as e:
             logger.warning(f"Failed to fetch data for {symbol} (PERMNO={permno}): {e}")
             return pd.DataFrame(
-                columns=["open", "high", "low", "close", "volume", "vwap"]
+                columns=["open", "high", "low", "close", "volume"]
             )
 
         if len(raw) == 0:
             return pd.DataFrame(
-                columns=["open", "high", "low", "close", "volume", "vwap"]
+                columns=["open", "high", "low", "close", "volume"]
             )
 
         return self._to_ohlcv(raw)
@@ -259,6 +257,40 @@ class WRDSDataSource:
         """
         return self._provider.sample_universe(as_of=as_of, n_symbols=n_symbols)
 
+    def sample_universe_historical(
+        self,
+        start_date: "date",
+        end_date: "date",
+        n_symbols: int | None = None,
+        rebalance_frequency: str | None = None,
+    ) -> List[str]:
+        """
+        Sample a survivorship-bias-free universe across a historical period.
+
+        Takes point-in-time snapshots at regular intervals (quarterly by
+        default) throughout the training period and unions the results.
+        This ensures stocks that were delisted during the training window
+        are still included for the periods when they were active.
+
+        Args:
+            start_date: Training period start date.
+            end_date: Training period end date.
+            n_symbols: Target symbols per snapshot.
+            rebalance_frequency: "quarterly", "monthly", or "annually".
+
+        Returns:
+            List of ticker symbols (sorted, deduplicated).
+        """
+        start = start_date.date() if isinstance(start_date, datetime) else start_date
+        end = end_date.date() if isinstance(end_date, datetime) else end_date
+
+        return self._provider.sample_universe_historical(
+            start=start,
+            end=end,
+            n_symbols=n_symbols,
+            rebalance_frequency=rebalance_frequency,
+        )
+
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -273,67 +305,37 @@ class WRDSDataSource:
                 self._ticker_permno_cache[ticker] = None
         return self._ticker_permno_cache[ticker]
 
+    _REQUIRED_COLUMNS = ("prc", "askhi", "bidlo", "openprc", "vol")
+
     def _to_ohlcv(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Convert CRSP daily data to OHLCV format expected by tft-finance.
 
         Maps:
             close  ← prc (already sign-corrected)
-            high   ← askhi (fallback: close)
-            low    ← bidlo (fallback: close)
-            open   ← previous day's close
+            high   ← askhi
+            low    ← bidlo
+            open   ← openprc
             volume ← vol
-            vwap   ← close (approximation)
+
+        All columns are required. Missing values are left as NaN.
+
+        Raises:
+            SchemaValidationError: If any required column is missing.
         """
+        missing = [c for c in self._REQUIRED_COLUMNS if c not in df.columns]
+        if missing:
+            from wrds_data.exceptions import SchemaValidationError
+            raise SchemaValidationError(missing, context="adapter._to_ohlcv")
+
         result = pd.DataFrame(index=pd.to_datetime(df["date"]))
         result.index.name = None
 
-        # Close
+        result["open"] = df["openprc"].values
+        result["high"] = df["askhi"].values
+        result["low"] = df["bidlo"].values
         result["close"] = df["prc"].values
-
-        # High (ASKHI = highest ask or trade price)
-        if "askhi" in df.columns:
-            result["high"] = df["askhi"].values
-            # Fill missing with close
-            result["high"] = result["high"].fillna(result["close"])
-        else:
-            result["high"] = result["close"]
-
-        # Low (BIDLO = lowest bid or trade price)
-        if "bidlo" in df.columns:
-            result["low"] = df["bidlo"].values
-            result["low"] = result["low"].fillna(result["close"])
-        else:
-            result["low"] = result["close"]
-
-        # Volume
-        result["volume"] = df["vol"].values if "vol" in df.columns else 0
-
-        # Open — CRSP has no open price
-        # Best proxy: previous day's close
-        result["open"] = result["close"].shift(1)
-        result["open"] = result["open"].fillna(result["close"])  # First row
-
-        if not WRDSDataSource._open_warning_shown:
-            logger.info(
-                "CRSP does not provide open prices. "
-                "Using previous close as proxy for 'open'. "
-                "Features depending on open (e.g., gap, overnight return) "
-                "will be approximations."
-            )
-            WRDSDataSource._open_warning_shown = True
-
-        # VWAP — CRSP has no VWAP
-        result["vwap"] = result["close"]
-
-        if not WRDSDataSource._vwap_warning_shown:
-            logger.info(
-                "CRSP does not provide VWAP. "
-                "Using close as proxy for 'vwap'. "
-                "Features depending on VWAP (e.g., VWAPDistance) "
-                "will be less informative."
-            )
-            WRDSDataSource._vwap_warning_shown = True
+        result["volume"] = df["vol"].values
 
         # Sort by date
         result = result.sort_index()

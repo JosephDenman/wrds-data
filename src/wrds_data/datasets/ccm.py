@@ -40,4 +40,5 @@ CCM_LINK = DatasetDefinition(
     },
     description="CRSP-Compustat Merged Link History — GVKEY to PERMNO mapping with date ranges",
     default_chunk_years=50,  # Small table, download all at once
+    is_reference_table=True,
 )

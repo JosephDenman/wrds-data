@@ -5,16 +5,16 @@ These are computed from the corrected CRSP and Compustat data:
 
 1. MarketCapCalculation — |PRC| × SHROUT
 2. BookToMarketCalculation — BE / ME
-3. OperatingProfitabilityCalculation — (REVT - COGS) / AT  (Novy-Marx 2013)
-4. InvestmentRateCalculation — CAPX / AT
+3. OperatingProfitabilityCalculation — (SALE - COGS - XSGA - XINT) / BE  (FF5)
+4. InvestmentRateCalculation — AT / AT_lag - 1  (asset growth, FF5)
 
 Unlike corrections that filter rows, these ADD columns to the DataFrame.
 They are applied after the CRSP-Compustat merge.
 
 References:
     - Fama, E. & French, K. (1993). Book-to-market ratio construction.
-    - Novy-Marx, R. (2013). "The Other Side of Value."
-    - Fama, E. & French, K. (2015). Five-factor model: profitability & investment.
+    - Fama, E. & French, K. (2015). "A Five-Factor Asset Pricing Model."
+    - tidyfinance Python package conventions.
 """
 
 from __future__ import annotations
@@ -102,12 +102,21 @@ class BookToMarketCalculation(CorrectionStep):
 
 class OperatingProfitabilityCalculation(CorrectionStep):
     """
-    Calculate operating profitability (Novy-Marx 2013).
+    Calculate operating profitability (Fama-French 2015 / tidyfinance convention).
 
-    op = (revt - cogs) / at
+    op = (sale - cogs - xsga - xint) / be
 
-    Gross profitability scaled by total assets. This is a strong
-    predictor of stock returns, particularly when combined with value.
+    Revenue minus cost of goods sold, SGA expenses, and interest expense,
+    scaled by book equity. This follows the Fama-French five-factor model
+    definition used in tidyfinance.
+
+    Requires 'be' column from BookEquityCalculation.
+    Falls back to 'revt' if 'sale' is not available.
+    Missing cost components (cogs, xsga, xint) are filled with 0.
+
+    References:
+        - Fama, E. & French, K. (2015). "A Five-Factor Asset Pricing Model."
+        - tidyfinance Python package: download_data_compustat() implementation
     """
 
     @property
@@ -116,20 +125,31 @@ class OperatingProfitabilityCalculation(CorrectionStep):
 
     @property
     def description(self) -> str:
-        return "Compute op = (revt - cogs) / at (Novy-Marx 2013)"
+        return "Compute op = (sale - cogs - xsga - xint) / be (FF5 / tidyfinance)"
 
     @property
     def required_columns(self) -> list[str]:
-        return ["at"]
+        return ["be"]
 
     def apply(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
 
-        revt = df.get("revt", pd.Series(np.nan, index=df.index))
-        cogs = df.get("cogs", pd.Series(0.0, index=df.index)).fillna(0)
+        # Revenue: prefer 'sale', fall back to 'revt'
+        if "sale" in df.columns:
+            revenue = df["sale"].copy()
+            if "revt" in df.columns:
+                revenue = revenue.fillna(df["revt"])
+        else:
+            revenue = df.get("revt", pd.Series(np.nan, index=df.index))
 
-        valid = (df["at"] > 0) & revt.notna()
-        df["op"] = np.where(valid, (revt - cogs) / df["at"], np.nan)
+        cogs = df.get("cogs", pd.Series(0.0, index=df.index)).fillna(0)
+        xsga = df.get("xsga", pd.Series(0.0, index=df.index)).fillna(0)
+        xint = df.get("xint", pd.Series(0.0, index=df.index)).fillna(0)
+
+        valid = (df["be"] > 0) & revenue.notna()
+        df["op"] = np.where(
+            valid, (revenue - cogs - xsga - xint) / df["be"], np.nan
+        )
 
         n_valid = valid.sum()
         logger.debug(
@@ -141,12 +161,20 @@ class OperatingProfitabilityCalculation(CorrectionStep):
 
 class InvestmentRateCalculation(CorrectionStep):
     """
-    Calculate investment rate.
+    Calculate investment rate as asset growth (Fama-French 2015 / tidyfinance).
 
-    inv = capx / at
+    inv = at / at_lag - 1
 
-    Capital expenditures scaled by total assets. Used in Fama-French
-    five-factor model (CMA factor).
+    Total asset growth rate, where at_lag is the previous year's total assets
+    for the same firm (gvkey). This follows the Fama-French five-factor model
+    definition (CMA factor) as implemented in tidyfinance.
+
+    Requires data sorted by (gvkey, datadate/fyear) so that lag is meaningful.
+    First observation per firm will have NaN investment rate.
+
+    References:
+        - Fama, E. & French, K. (2015). "A Five-Factor Asset Pricing Model."
+        - tidyfinance Python package: download_data_compustat() implementation
     """
 
     @property
@@ -155,23 +183,33 @@ class InvestmentRateCalculation(CorrectionStep):
 
     @property
     def description(self) -> str:
-        return "Compute inv = capx / at"
+        return "Compute inv = at / at_lag - 1 (asset growth, FF5 / tidyfinance)"
 
     @property
     def required_columns(self) -> list[str]:
-        return ["at"]
+        return ["gvkey", "at"]
 
     def apply(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
 
-        capx = df.get("capx", pd.Series(np.nan, index=df.index))
+        # Sort by firm and time to ensure correct lagging
+        sort_col = "fyear" if "fyear" in df.columns else "datadate"
+        df = df.sort_values(["gvkey", sort_col])
 
-        valid = (df["at"] > 0) & capx.notna()
-        df["inv"] = np.where(valid, capx / df["at"], np.nan)
+        # Compute lagged total assets per firm
+        df["at_lag"] = df.groupby("gvkey")["at"].shift(1)
+
+        # Investment = asset growth rate
+        valid = (df["at_lag"] > 0) & df["at"].notna()
+        df["inv"] = np.where(valid, df["at"] / df["at_lag"] - 1, np.nan)
+
+        # Clean up temporary column
+        df = df.drop(columns=["at_lag"])
 
         n_valid = valid.sum()
         logger.debug(
-            f"  Investment rate computed for {n_valid:,}/{len(df):,} observations"
+            f"  Investment rate (asset growth) computed for {n_valid:,}/{len(df):,} "
+            f"observations"
         )
         return df
 

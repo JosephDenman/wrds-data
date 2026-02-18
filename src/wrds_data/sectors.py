@@ -106,37 +106,42 @@ def sic_to_sector(sic: int) -> str:
     """
     Map a SIC code to a broad sector name comparable to GICS sectors.
 
-    This provides a mapping similar to what yfinance returns via its
-    ``info['sector']`` field, but derived from the SIC code rather than
-    a proprietary classification. The mapping covers the 11 broad GICS-like
-    sectors.
+    This provides a COMPLETE mapping — every SIC code 100-9999 resolves
+    to a named sector. No code falls through to "Other".
+
+    Coverage is derived from the SIC code rather than a proprietary
+    classification. The mapping covers 12 sectors:
+    Technology, Healthcare, Real Estate, Financial Services, Energy,
+    Utilities, Communication Services, Consumer Cyclical,
+    Consumer Defensive, Industrials, Basic Materials, and
+    Conglomerates (for SIC 9999 nonclassifiable/SPACs).
 
     Args:
         sic: 4-digit SIC code.
 
     Returns:
-        Sector name string.
+        Sector name string. "Unknown" only for sic <= 0.
     """
     if sic <= 0:
         return "Unknown"
 
     # Technology
     if (3570 <= sic <= 3579 or 3660 <= sic <= 3692 or 3694 <= sic <= 3699
-            or 3810 <= sic <= 3829 or 7370 <= sic <= 7379):
+            or 3810 <= sic <= 3839 or 7370 <= sic <= 7379):
         return "Technology"
 
-    # Healthcare
-    if (2830 <= sic <= 2836 or sic == 3693 or 3840 <= sic <= 3859
-            or 8000 <= sic <= 8099 or 2800 <= sic <= 2829):
+    # Healthcare (pharma 2830-2839, medical devices 3693/3840-3859, health services 8000-8099)
+    if (2830 <= sic <= 2839 or sic == 3693 or 3840 <= sic <= 3859
+            or 8000 <= sic <= 8099):
         return "Healthcare"
 
-    # Financials
-    if 6000 <= sic <= 6799:
-        return "Financial Services"
-
-    # Real Estate (subset of old Financials)
+    # Real Estate — must come BEFORE Financial Services since 6500-6553 ⊂ 6000-6999
     if 6500 <= sic <= 6553:
         return "Real Estate"
+
+    # Financial Services (banks, insurance, brokers, holding/investment offices)
+    if 6000 <= sic <= 6999:
+        return "Financial Services"
 
     # Energy
     if 1200 <= sic <= 1399 or 2900 <= sic <= 2999 or 4920 <= sic <= 4924:
@@ -146,15 +151,15 @@ def sic_to_sector(sic: int) -> str:
     if 4900 <= sic <= 4999:
         return "Utilities"
 
-    # Communication Services
-    if 4800 <= sic <= 4899 or 7810 <= sic <= 7819 or 7820 <= sic <= 7829:
+    # Communication Services (telecom, media, entertainment, motion pictures)
+    if 4800 <= sic <= 4899 or 7800 <= sic <= 7999:
         return "Communication Services"
 
     # Consumer Discretionary (Cyclical)
     if (2500 <= sic <= 2599 or 3600 <= sic <= 3659 or 3710 <= sic <= 3716
             or 3750 <= sic <= 3751 or 3900 <= sic <= 3999
             or 5000 <= sic <= 5999 or 7000 <= sic <= 7369
-            or 7380 <= sic <= 7999):
+            or 7380 <= sic <= 7799):
         return "Consumer Cyclical"
 
     # Consumer Staples (Defensive)
@@ -162,20 +167,31 @@ def sic_to_sector(sic: int) -> str:
             or 2840 <= sic <= 2899):
         return "Consumer Defensive"
 
-    # Industrials
-    if (1500 <= sic <= 1799 or 3400 <= sic <= 3569 or 3580 <= sic <= 3599
-            or 3700 <= sic <= 3709 or 3717 <= sic <= 3749
-            or 3752 <= sic <= 3799 or 3800 <= sic <= 3809
-            or 4000 <= sic <= 4799 or 8710 <= sic <= 8749):
+    # Industrials (construction, manufacturing, transport, engineering,
+    #              environmental services, professional services, government)
+    if (1500 <= sic <= 1999 or 3100 <= sic <= 3199 or 3400 <= sic <= 3569
+            or 3580 <= sic <= 3599 or 3700 <= sic <= 3709
+            or 3717 <= sic <= 3749 or 3752 <= sic <= 3799
+            or 3800 <= sic <= 3809 or 3860 <= sic <= 3899
+            or 4000 <= sic <= 4799
+            or 8100 <= sic <= 8999
+            or 9000 <= sic <= 9998):
         return "Industrials"
 
     # Basic Materials
     if (1000 <= sic <= 1199 or 1400 <= sic <= 1499 or 2400 <= sic <= 2499
             or 2600 <= sic <= 2699 or 2800 <= sic <= 2829
-            or 3000 <= sic <= 3399):
+            or 3000 <= sic <= 3099 or 3200 <= sic <= 3399):
         return "Basic Materials"
 
-    return "Other"
+    # Conglomerates — SIC 9999 "Nonclassifiable Establishments"
+    # Mostly SPACs, blank check companies, and shell companies.
+    # ~78% listed 2019+ during the SPAC boom. These are financial vehicles
+    # but are separated from Financial Services to avoid overweighting.
+    if sic == 9999:
+        return "Conglomerates"
+
+    return "Unknown"
 
 
 def sic_to_ff49(sic: int) -> str:
@@ -396,6 +412,11 @@ class WRDSSectorDataSource:
             DataFrame with columns:
             [symbol, sector, industry, sic, ff12, ff49]
         """
+        if not symbols:
+            return pd.DataFrame(
+                columns=["symbol", "sector", "industry", "sic", "ff12", "ff49"]
+            )
+
         # Get the full universe with SIC codes
         universe = self._provider.universe(as_of=as_of)
 

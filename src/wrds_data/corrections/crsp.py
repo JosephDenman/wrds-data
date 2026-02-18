@@ -3,13 +3,20 @@ CRSP data corrections.
 
 Seven corrections following standard academic methodology:
 
-1. ShareCodeFilter — ordinary common shares only (SHRCD 10, 11)
-2. ExchangeCodeFilter — major US exchanges (NYSE, AMEX, NASDAQ)
-3. PriceSignCorrection — handle CRSP negative price convention
-4. DelistingAdjustment — survivorship bias correction (Shumway 1997)
-5. PennyStockFilter — exclude low-priced stocks
-6. MinimumHistoryFilter — exclude securities with too few observations
-7. VolumeValidation — remove rows with invalid volume/shares data
+1. ShareCodeFilter — ordinary common shares only (SHRCD 10, 11) [v1 only]
+2. ExchangeCodeFilter — major US exchanges (NYSE, AMEX, NASDAQ) [v1 only]
+3. PriceSignCorrection — handle CRSP negative price convention [v1 + v2]
+4. DelistingAdjustment — survivorship bias correction (Shumway 1997) [v1 only]
+5. PennyStockFilter — exclude low-priced stocks [v1 + v2]
+6. MinimumHistoryFilter — exclude securities with too few observations [v1 + v2]
+7. VolumeValidation — remove rows with invalid volume/shares data [v1 + v2]
+
+For CRSP v2 (CIZ format, sole format after Jan 2025), steps 1, 2, and 4
+are automatically skipped because they are handled in the SQL query's
+JOIN with crsp.stksecurityinfohist:
+    - ShareCodeFilter → replaced by ssih sharetype/securitytype/securitysubtype filters
+    - ExchangeCodeFilter → replaced by ssih primaryexch IN ('N','A','Q')
+    - DelistingAdjustment → delisting returns already included in DLYRET/MTHRET
 
 These corrections are applied to CRSP daily/monthly stock data AFTER
 it has been fetched and before it is used for analysis or merged with
@@ -23,6 +30,8 @@ References:
       Journal of Finance, 54(6), 2361-2379.
     - Fama, E. & French, K. (1993). "Common Risk Factors in the Returns
       on Stocks and Bonds." Journal of Financial Economics, 33(1), 3-56.
+    - CRSP Cross-Reference Guide (SIZ to CIZ):
+      https://www.crsp.org/wp-content/uploads/guides/CRSP_Cross_Reference_Guide_1.0_to_2.0.pdf
 """
 
 from __future__ import annotations
@@ -377,22 +386,51 @@ def build_crsp_pipeline(config: CRSPCorrectionConfig) -> list[CorrectionStep]:
     Steps are returned in the canonical order. The caller wraps them
     in a CorrectionPipeline.
 
-    Note: DelistingAdjustment is included but requires
-    ``set_delisting_data()`` to be called before the pipeline runs.
+    For CRSP v2 (CIZ format), three corrections are automatically skipped
+    because they are handled in the SQL query's stksecurityinfohist JOIN:
+        - ShareCodeFilter (replaced by ssih security type/subtype filters)
+        - ExchangeCodeFilter (replaced by ssih primaryexch filter)
+        - DelistingAdjustment (delisting returns already included in DLYRET/MTHRET)
+
+    For v1, all corrections apply as in classic Fama-French methodology.
+
+    Note: DelistingAdjustment (v1 only) requires ``set_delisting_data()``
+    to be called before the pipeline runs.
     """
+    is_v2 = config.crsp_version == "v2"
     steps: list[CorrectionStep] = []
 
-    if config.share_code_filter:
+    # ShareCodeFilter: v1 only (v2 handles via stksecurityinfohist JOIN)
+    if config.share_code_filter and not is_v2:
         steps.append(ShareCodeFilter(config))
+    elif config.share_code_filter and is_v2:
+        logger.debug(
+            "Skipping ShareCodeFilter for CRSP v2 "
+            "(handled in stksecurityinfohist JOIN)"
+        )
 
-    if config.exchange_code_filter:
+    # ExchangeCodeFilter: v1 only (v2 handles via stksecurityinfohist JOIN)
+    if config.exchange_code_filter and not is_v2:
         steps.append(ExchangeCodeFilter(config))
+    elif config.exchange_code_filter and is_v2:
+        logger.debug(
+            "Skipping ExchangeCodeFilter for CRSP v2 "
+            "(handled in stksecurityinfohist JOIN)"
+        )
 
+    # PriceSignCorrection: applies to both v1 and v2
+    # (v2 DLYPRC still uses negative-price convention for bid-ask midpoints)
     if config.price_sign_correction:
         steps.append(PriceSignCorrection())
 
-    if config.delisting_adjustment:
+    # DelistingAdjustment: v1 only (v2 includes delisting returns in DLYRET/MTHRET)
+    if config.delisting_adjustment and not is_v2:
         steps.append(DelistingAdjustment(config))
+    elif config.delisting_adjustment and is_v2:
+        logger.debug(
+            "Skipping DelistingAdjustment for CRSP v2 "
+            "(delisting returns included in DLYRET/MTHRET)"
+        )
 
     if config.penny_stock_filter:
         steps.append(PennyStockFilter(config))

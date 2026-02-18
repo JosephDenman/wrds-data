@@ -81,13 +81,13 @@ class TestBookEquityCalculation:
         assert len(row) == 1
         assert abs(row["be"].values[0] - 465.0) < 0.01
 
-    def test_fallback_to_ceq_pstk(self, synthetic_compustat):
+    def test_fallback_to_ceq_pstk_and_txdb_itcb(self, synthetic_compustat):
         step = BookEquityCalculation()
         result = step.apply(synthetic_compustat)
 
         # GVKEY 003: SEQ=NaN, CEQ=420, PSTK=30 → SE fallback = 420 + 30 = 450
         # PSTKRV=NaN, PSTKL=35 → PS = 35
-        # TXDITC=15
+        # TXDITC=NaN → fallback to TXDB(10) + ITCB(5) = 15
         # BE = 450 + 15 - 35 = 430
         row = result[(result["gvkey"] == "003") & (result["fyear"] == 2019)]
         assert len(row) == 1

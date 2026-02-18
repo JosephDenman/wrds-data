@@ -40,7 +40,7 @@ import pandas as pd
 from loguru import logger
 
 from wrds_data.config import UniverseSamplingConfig
-from wrds_data.sectors import sic_to_ff12
+from wrds_data.sectors import sic_to_sector
 
 
 class WRDSUniverseSampler:
@@ -68,6 +68,121 @@ class WRDSUniverseSampler:
         from wrds_data.provider import WRDSDataProvider
         self._provider = provider
         self._config = config or UniverseSamplingConfig()
+
+    # ------------------------------------------------------------------
+    # Point-in-time historical sampling (survivorship-bias-free)
+    # ------------------------------------------------------------------
+
+    def sample_historical(
+        self,
+        start: date,
+        end: date,
+        n_symbols: int | None = None,
+        rebalance_frequency: str | None = None,
+        random_seed: int | None = None,
+    ) -> List[str]:
+        """
+        Sample a survivorship-bias-free universe across a historical period.
+
+        Instead of sampling at a single date (which excludes stocks that were
+        delisted before that date), this method samples the universe at multiple
+        points throughout the training period and unions the results.
+
+        A stock that was active in 2012 but delisted in 2015 will appear in
+        the snapshots taken at/before 2015, and thus be included in the union.
+        The downstream quarterly universe filter then handles per-quarter
+        tradability masking.
+
+        Args:
+            start: Training period start date.
+            end: Training period end date.
+            n_symbols: Target symbols per snapshot. None = use config default.
+                       The final union will typically be larger than this since
+                       different snapshots contribute different stocks.
+            rebalance_frequency: How often to snapshot. One of "quarterly",
+                                 "annually", "monthly". None = use config default.
+            random_seed: Override config seed for reproducibility.
+
+        Returns:
+            List of ticker symbols (sorted, deduplicated union across all
+            snapshots).
+        """
+        freq = rebalance_frequency or self._config.rebalance_frequency
+        seed = random_seed if random_seed is not None else self._config.random_seed
+        n = min(n_symbols or self._config.n_symbols, self._config.max_symbols)
+
+        # Generate rebalance dates (end of each period)
+        freq_map = {"quarterly": "QE", "monthly": "ME", "annually": "YE"}
+        pd_freq = freq_map.get(freq)
+        if pd_freq is None:
+            raise ValueError(
+                f"Unknown rebalance_frequency: '{freq}'. "
+                f"Valid options: {list(freq_map.keys())}"
+            )
+
+        rebalance_dates = pd.date_range(start, end, freq=pd_freq)
+
+        # Ensure the end date itself is included (it may fall mid-period)
+        end_ts = pd.Timestamp(end)
+        if len(rebalance_dates) == 0 or rebalance_dates[-1] < end_ts:
+            rebalance_dates = rebalance_dates.union(
+                pd.DatetimeIndex([end_ts])
+            ).sort_values()
+
+        # Also include the start date to capture stocks that may delist early
+        start_ts = pd.Timestamp(start)
+        if rebalance_dates[0] > start_ts:
+            rebalance_dates = pd.DatetimeIndex([start_ts]).union(
+                rebalance_dates
+            ).sort_values()
+
+        logger.info(
+            f"Point-in-time historical sampling: {len(rebalance_dates)} snapshots "
+            f"({freq}) from {start} to {end}"
+        )
+
+        all_symbols: Set[str] = set()
+        snapshot_counts: List[int] = []
+
+        for i, rebalance_ts in enumerate(rebalance_dates):
+            snapshot_date = rebalance_ts.date()
+
+            # Use consistent seed per snapshot for reproducibility,
+            # but vary it so each snapshot isn't identical
+            snapshot_seed = seed + i
+
+            try:
+                snapshot_symbols = self._sample_impl(
+                    as_of=snapshot_date,
+                    n_symbols=n,
+                    random_seed=snapshot_seed,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"  Snapshot {i+1}/{len(rebalance_dates)} ({snapshot_date}) "
+                    f"failed: {e}"
+                )
+                snapshot_counts.append(0)
+                continue
+
+            new_symbols = set(snapshot_symbols) - all_symbols
+            all_symbols.update(snapshot_symbols)
+            snapshot_counts.append(len(snapshot_symbols))
+
+            logger.info(
+                f"  [{i+1}/{len(rebalance_dates)}] as_of={snapshot_date}: "
+                f"{len(snapshot_symbols)} sampled, "
+                f"{len(new_symbols)} new, "
+                f"{len(all_symbols)} cumulative"
+            )
+
+        logger.info(
+            f"Historical sampling complete: {len(all_symbols)} unique symbols "
+            f"from {len(rebalance_dates)} snapshots "
+            f"(avg {np.mean(snapshot_counts):.0f} per snapshot)"
+        )
+
+        return sorted(all_symbols)
 
     def sample(
         self,
@@ -244,9 +359,9 @@ class WRDSUniverseSampler:
             how="left",
         )
 
-        # Add sector classification
+        # Add sector classification (GICS-like, not FF12 — better coverage)
         stats["sector"] = stats["siccd"].apply(
-            lambda sic: sic_to_ff12(int(sic)) if pd.notna(sic) else "Other"
+            lambda sic: sic_to_sector(int(sic)) if pd.notna(sic) else "Unknown"
         )
 
         return stats

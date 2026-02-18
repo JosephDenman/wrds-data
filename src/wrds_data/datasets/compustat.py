@@ -10,12 +10,15 @@ Column names follow Compustat conventions:
     - PSTKRV: preferred stock (redemption value)
     - PSTKL: preferred stock (liquidating value)
     - TXDITC: deferred taxes and investment tax credit
+    - TXDB: deferred taxes (balance sheet)
+    - ITCB: investment tax credit (balance sheet)
+    - SALE: net sales/revenue
     - REVT: revenue (total)
     - COGS: cost of goods sold
     - XSGA: selling, general, and administrative expense
     - XINT: interest and related expense
     - CAPX: capital expenditures
-    - SIC: standard industrial classification code
+    - SICH: standard industrial classification code (historical)
 
 Data format filters:
     - datafmt='STD': standardized format
@@ -50,7 +53,10 @@ COMPUSTAT_ANNUAL = DatasetDefinition(
         "pstkrv": "pstkrv",
         "pstkl": "pstkl",
         "txditc": "txditc",
+        "txdb": "txdb",
+        "itcb": "itcb",
         # Income statement
+        "sale": "sale",
         "revt": "revt",
         "cogs": "cogs",
         "xsga": "xsga",
@@ -58,15 +64,15 @@ COMPUSTAT_ANNUAL = DatasetDefinition(
         # Investment
         "capx": "capx",
         # Classification
-        "sic": "sic",
+        "sic": "sich",  # Compustat uses 'sich' (SIC Historical), not 'sic'
         "curcd": "curcd",
         # Data format identifiers (for filtering)
         "datafmt": "datafmt",
         "popsrc": "popsrc",
         "consol": "consol",
         "indfmt": "indfmt",
-        # Report date (for point-in-time alignment)
-        "rdq": "rdq",
+        # NOTE: rdq (report date) does NOT exist in comp.funda — only in comp.fundq.
+        # Point-in-time alignment for annual data uses datadate + fallback_days.
     },
     description="Compustat Annual Fundamentals — balance sheet, income statement, cash flow",
     default_chunk_years=10,
@@ -92,14 +98,15 @@ COMPUSTAT_QUARTERLY = DatasetDefinition(
         "revtq": "revtq",
         "cogsq": "cogsq",
         # Classification
-        "sic": "sic",
+        # NOTE: sich does NOT exist in comp.fundq — only in comp.funda.
+        # SIC codes for quarterly data should be merged from annual or dsenames.
         "curcdq": "curcdq",
         # Data format
         "datafmt": "datafmt",
         "popsrc": "popsrc",
         "consol": "consol",
         "indfmt": "indfmt",
-        # Report date
+        # Report date (rdq exists in fundq, used for point-in-time alignment)
         "rdq": "rdq",
     },
     description="Compustat Quarterly Fundamentals",

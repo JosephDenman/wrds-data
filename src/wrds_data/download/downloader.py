@@ -94,6 +94,13 @@ class BulkDownloader:
         output_dir = Path(self._storage.cache_dir) / dataset.name
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Reference tables (e.g. crsp_names, ccm_link) should be downloaded
+        # in full without date filtering. Their date_column represents validity
+        # ranges, not observation timestamps, so date-chunking misses records
+        # with date_column values outside the requested range.
+        if dataset.is_reference_table:
+            return self._download_reference_table(dataset, output_dir, force)
+
         chunk_years = dataset.default_chunk_years
         year_ranges = self._compute_year_ranges(
             self._start_year, self._end_year, chunk_years
@@ -158,6 +165,68 @@ class BulkDownloader:
             f"Downloaded '{dataset.name}': {total_rows:,} total rows"
         )
         return total_rows
+
+    def _download_reference_table(
+        self,
+        dataset: DatasetDefinition,
+        output_dir: Path,
+        force: bool = False,
+    ) -> int:
+        """
+        Download a reference/dimension table in full (no date filtering).
+
+        Reference tables like crsp_names and ccm_link store validity date
+        ranges (namedt/nameendt, linkdt/linkenddt). Date-chunking would miss
+        records with start dates outside the requested range — e.g. a stock
+        listed in 1985 that is still actively trading would be excluded from
+        a 2010-2026 download.
+        """
+        fname = f"{dataset.name}.parquet"
+        output_path = output_dir / fname
+        failed_marker = output_dir / f"{fname}.FAILED"
+
+        logger.info(f"Downloading '{dataset.name}' (reference table, full download)")
+
+        # Skip if already downloaded (unless force)
+        if output_path.exists() and not force:
+            try:
+                existing = pd.read_parquet(output_path)
+                logger.info(
+                    f"  Skipping {fname} (exists, {len(existing):,} rows)"
+                )
+                return len(existing)
+            except Exception:
+                logger.warning(f"  Corrupt file {fname}, re-downloading")
+
+        # Clean up old failed marker
+        if failed_marker.exists():
+            failed_marker.unlink()
+
+        try:
+            # No date_range → full table download
+            df = self._backend.query(dataset)
+
+            if len(df) == 0:
+                logger.warning(f"  No data returned for {dataset.name}")
+                return 0
+
+            # Remove any old date-chunked files that may exist from previous
+            # downloads (e.g. crsp_names_2010_2026.parquet)
+            for old_file in output_dir.glob(f"{dataset.name}_*.parquet"):
+                logger.info(f"  Removing old chunked file: {old_file.name}")
+                old_file.unlink()
+
+            df.to_parquet(output_path, index=False)
+            logger.info(
+                f"  Downloaded '{dataset.name}': {len(df):,} rows"
+            )
+            return len(df)
+
+        except Exception as e:
+            failed_marker.touch()
+            raise DownloadError(
+                f"Failed to download reference table '{dataset.name}': {e}"
+            ) from e
 
     @staticmethod
     def _compute_year_ranges(

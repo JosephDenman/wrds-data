@@ -49,10 +49,14 @@ def synthetic_crsp_daily() -> pd.DataFrame:
             # Sprinkle some negative prices (bid-ask midpoint convention)
             prc = -price if np.random.random() < 0.05 else price
 
+            # OPENPRC: available from 1992-06-15; simulate with slight offset from close
+            openprc = price * (1 + np.random.normal(0, 0.005))
+
             rows.append({
                 "permno": permno,
                 "date": trading_date,
                 "prc": prc,
+                "openprc": openprc,
                 "askhi": price * (1 + abs(np.random.normal(0, 0.01))),
                 "bidlo": price * (1 - abs(np.random.normal(0, 0.01))),
                 "vol": max(1, int(np.random.lognormal(10, 1))),
@@ -113,8 +117,9 @@ def synthetic_compustat() -> pd.DataFrame:
         {
             "gvkey": "001", "datadate": date(2019, 12, 31), "fyear": 2019,
             "at": 1000.0, "lt": 400.0, "seq": 500.0, "ceq": 450.0,
-            "pstk": 50.0, "pstkrv": 55.0, "pstkl": 52.0, "txditc": 20.0,
-            "revt": 800.0, "cogs": 500.0, "xsga": 100.0, "xint": 30.0,
+            "pstk": 50.0, "pstkrv": 55.0, "pstkl": 52.0,
+            "txditc": 20.0, "txdb": 15.0, "itcb": 5.0,
+            "sale": 810.0, "revt": 800.0, "cogs": 500.0, "xsga": 100.0, "xint": 30.0,
             "capx": 80.0, "sic": "3571", "curcd": "USD",
             "datafmt": "STD", "popsrc": "D", "consol": "C", "indfmt": "INDL",
             "rdq": date(2020, 2, 15),
@@ -123,8 +128,9 @@ def synthetic_compustat() -> pd.DataFrame:
         {
             "gvkey": "001", "datadate": date(2020, 12, 31), "fyear": 2020,
             "at": 1100.0, "lt": 420.0, "seq": 550.0, "ceq": 500.0,
-            "pstk": 50.0, "pstkrv": 55.0, "pstkl": 52.0, "txditc": 22.0,
-            "revt": 900.0, "cogs": 550.0, "xsga": 110.0, "xint": 28.0,
+            "pstk": 50.0, "pstkrv": 55.0, "pstkl": 52.0,
+            "txditc": 22.0, "txdb": 17.0, "itcb": 5.0,
+            "sale": 910.0, "revt": 900.0, "cogs": 550.0, "xsga": 110.0, "xint": 28.0,
             "capx": 90.0, "sic": "3571", "curcd": "USD",
             "datafmt": "STD", "popsrc": "D", "consol": "C", "indfmt": "INDL",
             "rdq": date(2021, 2, 20),
@@ -133,18 +139,20 @@ def synthetic_compustat() -> pd.DataFrame:
         {
             "gvkey": "002", "datadate": date(2019, 12, 31), "fyear": 2019,
             "at": 5000.0, "lt": 4500.0, "seq": 400.0, "ceq": 350.0,
-            "pstk": 50.0, "pstkrv": 55.0, "pstkl": 52.0, "txditc": 10.0,
-            "revt": 200.0, "cogs": 50.0, "xsga": 40.0, "xint": 100.0,
+            "pstk": 50.0, "pstkrv": 55.0, "pstkl": 52.0,
+            "txditc": 10.0, "txdb": 8.0, "itcb": 2.0,
+            "sale": 210.0, "revt": 200.0, "cogs": 50.0, "xsga": 40.0, "xint": 100.0,
             "capx": 20.0, "sic": "6020", "curcd": "USD",
             "datafmt": "STD", "popsrc": "D", "consol": "C", "indfmt": "INDL",
             "rdq": date(2020, 3, 1),
         },
-        # GVKEY 003: missing SEQ (tests fallback to CEQ + PSTK)
+        # GVKEY 003: missing SEQ and TXDITC (tests fallback hierarchies)
         {
             "gvkey": "003", "datadate": date(2019, 12, 31), "fyear": 2019,
             "at": 800.0, "lt": 300.0, "seq": np.nan, "ceq": 420.0,
-            "pstk": 30.0, "pstkrv": np.nan, "pstkl": 35.0, "txditc": 15.0,
-            "revt": 600.0, "cogs": 400.0, "xsga": 80.0, "xint": 20.0,
+            "pstk": 30.0, "pstkrv": np.nan, "pstkl": 35.0,
+            "txditc": np.nan, "txdb": 10.0, "itcb": 5.0,
+            "sale": 610.0, "revt": 600.0, "cogs": 400.0, "xsga": 80.0, "xint": 20.0,
             "capx": 60.0, "sic": "2800", "curcd": "USD",
             "datafmt": "STD", "popsrc": "D", "consol": "C", "indfmt": "INDL",
             "rdq": date(2020, 2, 28),
@@ -153,8 +161,9 @@ def synthetic_compustat() -> pd.DataFrame:
         {
             "gvkey": "004", "datadate": date(2019, 12, 31), "fyear": 2019,
             "at": 500.0, "lt": 200.0, "seq": 250.0, "ceq": 230.0,
-            "pstk": 20.0, "pstkrv": 25.0, "pstkl": 22.0, "txditc": 5.0,
-            "revt": 300.0, "cogs": 200.0, "xsga": 30.0, "xint": 10.0,
+            "pstk": 20.0, "pstkrv": 25.0, "pstkl": 22.0,
+            "txditc": 5.0, "txdb": 3.0, "itcb": 2.0,
+            "sale": 310.0, "revt": 300.0, "cogs": 200.0, "xsga": 30.0, "xint": 10.0,
             "capx": 40.0, "sic": "2000", "curcd": "GBP",
             "datafmt": "STD", "popsrc": "D", "consol": "C", "indfmt": "INDL",
             "rdq": date(2020, 3, 15),

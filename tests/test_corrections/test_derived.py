@@ -47,42 +47,101 @@ class TestBookToMarketCalculation:
 
 class TestOperatingProfitabilityCalculation:
 
-    def test_computes_op(self):
+    def test_computes_op_with_sale(self):
+        """OP = (sale - cogs - xsga - xint) / be (tidyfinance/FF5 formula)."""
         df = pd.DataFrame({
-            "revt": [800.0, 600.0],
+            "sale": [800.0, 600.0],
             "cogs": [500.0, 400.0],
-            "at": [1000.0, 800.0],
+            "xsga": [100.0, 80.0],
+            "xint": [30.0, 20.0],
+            "be": [465.0, 430.0],
         })
         step = OperatingProfitabilityCalculation()
         result = step.apply(df)
         assert "op" in result.columns
-        assert abs(result["op"].values[0] - 0.3) < 0.001   # (800-500)/1000
-        assert abs(result["op"].values[1] - 0.25) < 0.001  # (600-400)/800
+        # (800 - 500 - 100 - 30) / 465 = 170 / 465 ≈ 0.3656
+        assert abs(result["op"].values[0] - (170.0 / 465.0)) < 0.001
+        # (600 - 400 - 80 - 20) / 430 = 100 / 430 ≈ 0.2326
+        assert abs(result["op"].values[1] - (100.0 / 430.0)) < 0.001
 
-    def test_handles_missing_cogs(self):
+    def test_falls_back_to_revt(self):
+        """When sale is missing, fall back to revt."""
         df = pd.DataFrame({
             "revt": [800.0],
-            "cogs": [np.nan],
-            "at": [1000.0],
+            "cogs": [500.0],
+            "xsga": [100.0],
+            "xint": [30.0],
+            "be": [465.0],
         })
         step = OperatingProfitabilityCalculation()
         result = step.apply(df)
-        # COGS fills to 0 → op = 800/1000 = 0.8
-        assert abs(result["op"].values[0] - 0.8) < 0.001
+        # (800 - 500 - 100 - 30) / 465 = 170 / 465
+        assert abs(result["op"].values[0] - (170.0 / 465.0)) < 0.001
+
+    def test_handles_missing_cost_components(self):
+        """Missing cogs/xsga/xint should fill to 0."""
+        df = pd.DataFrame({
+            "sale": [800.0],
+            "cogs": [np.nan],
+            "xsga": [np.nan],
+            "xint": [np.nan],
+            "be": [465.0],
+        })
+        step = OperatingProfitabilityCalculation()
+        result = step.apply(df)
+        # (800 - 0 - 0 - 0) / 465 = 800 / 465
+        assert abs(result["op"].values[0] - (800.0 / 465.0)) < 0.001
+
+    def test_negative_be_produces_nan(self):
+        """Negative book equity should produce NaN."""
+        df = pd.DataFrame({
+            "sale": [800.0],
+            "cogs": [500.0],
+            "xsga": [100.0],
+            "xint": [30.0],
+            "be": [-100.0],
+        })
+        step = OperatingProfitabilityCalculation()
+        result = step.apply(df)
+        assert np.isnan(result["op"].values[0])
 
 
 class TestInvestmentRateCalculation:
 
-    def test_computes_inv(self):
+    def test_computes_inv_as_asset_growth(self):
+        """INV = at / at_lag - 1 (asset growth, tidyfinance/FF5 formula)."""
         df = pd.DataFrame({
-            "capx": [80.0, 60.0],
-            "at": [1000.0, 800.0],
+            "gvkey": ["001", "001", "001"],
+            "fyear": [2018, 2019, 2020],
+            "at": [900.0, 1000.0, 1100.0],
         })
         step = InvestmentRateCalculation()
         result = step.apply(df)
         assert "inv" in result.columns
-        assert abs(result["inv"].values[0] - 0.08) < 0.001  # 80/1000
-        assert abs(result["inv"].values[1] - 0.075) < 0.001  # 60/800
+        # First year: NaN (no lag available)
+        assert np.isnan(result["inv"].values[0])
+        # 2019: 1000/900 - 1 ≈ 0.1111
+        assert abs(result["inv"].values[1] - (1000.0 / 900.0 - 1)) < 0.001
+        # 2020: 1100/1000 - 1 = 0.1
+        assert abs(result["inv"].values[2] - 0.1) < 0.001
+
+    def test_separate_firms_no_cross_lag(self):
+        """Lagging should be within-firm only, not cross-firm."""
+        df = pd.DataFrame({
+            "gvkey": ["001", "001", "002", "002"],
+            "fyear": [2019, 2020, 2019, 2020],
+            "at": [1000.0, 1100.0, 500.0, 600.0],
+        })
+        step = InvestmentRateCalculation()
+        result = step.apply(df)
+        # Firm 001: first year NaN, second year 1100/1000 - 1 = 0.1
+        firm1 = result[result["gvkey"] == "001"].sort_values("fyear")
+        assert np.isnan(firm1["inv"].values[0])
+        assert abs(firm1["inv"].values[1] - 0.1) < 0.001
+        # Firm 002: first year NaN, second year 600/500 - 1 = 0.2
+        firm2 = result[result["gvkey"] == "002"].sort_values("fyear")
+        assert np.isnan(firm2["inv"].values[0])
+        assert abs(firm2["inv"].values[1] - 0.2) < 0.001
 
 
 class TestBuildDerivedPipeline:
@@ -100,13 +159,16 @@ class TestBuildDerivedPipeline:
         pipeline = CorrectionPipeline(steps)
 
         df = pd.DataFrame({
+            "gvkey": ["001", "001"],
+            "fyear": [2019, 2020],
             "prc": [50.0, 100.0],
             "shrout": [1000, 2000],
             "be": [100.0, 300.0],
-            "revt": [800.0, 600.0],
+            "sale": [800.0, 600.0],
             "cogs": [500.0, 400.0],
-            "at": [1000.0, 800.0],
-            "capx": [80.0, 60.0],
+            "xsga": [100.0, 80.0],
+            "xint": [30.0, 20.0],
+            "at": [1000.0, 1100.0],
         })
 
         result = pipeline.run(df)

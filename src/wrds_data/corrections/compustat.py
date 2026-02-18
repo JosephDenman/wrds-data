@@ -150,7 +150,7 @@ class BookEquityCalculation(CorrectionStep):
     def description(self) -> str:
         return (
             "Fama-French book equity: SEQ (or CEQ+PSTK, or AT-LT) "
-            "+ TXDITC - preferred stock (PSTKRV or PSTKL or PSTK)"
+            "+ TXDITC (or TXDB+ITCB) - preferred stock (PSTKRV or PSTKL or PSTK)"
         )
 
     @property
@@ -198,10 +198,21 @@ class BookEquityCalculation(CorrectionStep):
         # Fill remaining NaN as 0 (no preferred stock)
         ps = ps.fillna(0)
 
-        # --- Deferred Taxes ---
-        txditc = pd.Series(0.0, index=df.index)
+        # --- Deferred Taxes (tidyfinance convention) ---
+        # Primary: TXDITC (deferred taxes and investment tax credit)
+        # Fallback: TXDB + ITCB (balance sheet deferred taxes + investment tax credit)
+        # Final: 0 if all are missing
+        txditc = pd.Series(np.nan, index=df.index)
         if "txditc" in df.columns:
-            txditc = df["txditc"].fillna(0)
+            txditc = df["txditc"].copy()
+
+        # Build fallback from txdb + itcb
+        txdb = df["txdb"].fillna(0) if "txdb" in df.columns else pd.Series(0.0, index=df.index)
+        itcb = df["itcb"].fillna(0) if "itcb" in df.columns else pd.Series(0.0, index=df.index)
+        txdb_itcb = txdb + itcb
+
+        # combine_first: use txditc where available, fall back to txdb + itcb
+        txditc = txditc.combine_first(txdb_itcb).fillna(0)
 
         # --- Book Equity ---
         df["be"] = se + txditc - ps

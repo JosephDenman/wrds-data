@@ -39,10 +39,27 @@ class UniverseResolver:
             self._names_df = self._backend.query(CRSP_NAMES)
             self._names_df["namedt"] = pd.to_datetime(self._names_df["namedt"])
             self._names_df["nameendt"] = pd.to_datetime(self._names_df["nameendt"])
+
             # Fill missing end dates with far future
             self._names_df["nameendt"] = self._names_df["nameendt"].fillna(
                 pd.Timestamp("2099-12-31")
             )
+
+            # CRSP convention: securities still active at the last data update
+            # have nameendt set to the max date in the dataset (e.g. 2024-12-31)
+            # rather than a far-future sentinel. Extend these to 2099-12-31 so
+            # they pass the "nameendt >= as_of" filter for any reasonable date.
+            max_nameendt = self._names_df["nameendt"].max()
+            n_active = (self._names_df["nameendt"] == max_nameendt).sum()
+            if n_active > 0:
+                logger.debug(
+                    f"Extending {n_active:,} records with nameendt={max_nameendt.date()} "
+                    f"(CRSP data boundary) → 2099-12-31 (still active)"
+                )
+                self._names_df.loc[
+                    self._names_df["nameendt"] == max_nameendt, "nameendt"
+                ] = pd.Timestamp("2099-12-31")
+
             logger.debug(
                 f"Loaded {len(self._names_df):,} name history records "
                 f"for {self._names_df['permno'].nunique():,} PERMNOs"

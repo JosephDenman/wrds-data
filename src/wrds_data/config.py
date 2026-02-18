@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote_plus
 
 
 # ---------------------------------------------------------------------------
@@ -35,8 +36,10 @@ class WRDSConnectionConfig:
 
     @property
     def connection_string(self) -> str:
+        user = quote_plus(self.username)
+        pwd = quote_plus(self.password)
         return (
-            f"postgresql+psycopg2://{self.username}:{self.password}"
+            f"postgresql+psycopg2://{user}:{pwd}"
             f"@{self.host}:{self.port}/{self.dbname}"
         )
 
@@ -68,13 +71,26 @@ class CRSPCorrectionConfig:
 
     All defaults are the conservative, academically standard settings
     per Fama-French methodology and Shumway (1997).
+
+    The crsp_version parameter controls which CRSP table format is used:
+        - "v2" (default): CIZ format (crsp.dsf_v2/msf_v2). Data from July 2022,
+          sole format after Jan 2025. Share/exchange filtering and delisting
+          returns are handled in the SQL JOIN, so ShareCodeFilter,
+          ExchangeCodeFilter, and DelistingAdjustment are automatically skipped.
+        - "v1": Legacy SIZ format (crsp.dsf/msf). Data through Dec 2024 only.
+          All corrections applied as in classic Fama-French methodology.
     """
 
+    # CRSP data version: "v1" (legacy, frozen Dec 2024) or "v2" (CIZ, ongoing)
+    crsp_version: str = "v2"
+
     # Share code filter: keep only ordinary common shares
+    # NOTE: Automatically skipped for v2 (handled in SQL JOIN)
     share_code_filter: bool = True
     share_codes: tuple[int, ...] = (10, 11)
 
     # Exchange code filter: major US exchanges
+    # NOTE: Automatically skipped for v2 (handled in SQL JOIN)
     exchange_code_filter: bool = True
     exchange_codes: tuple[int, ...] = (1, 2, 3)  # NYSE, AMEX, NASDAQ
 
@@ -83,6 +99,7 @@ class CRSPCorrectionConfig:
 
     # Delisting return adjustment (Shumway 1997)
     # Critical for survivorship bias correction
+    # NOTE: Automatically skipped for v2 (delisting returns included in DLYRET/MTHRET)
     delisting_adjustment: bool = True
     delisting_return_otc: float = -0.30  # DLSTCD 400-499 (performance-related)
     delisting_return_exchange: float = -0.55  # DLSTCD 500+ (dropped by exchange)
@@ -93,7 +110,7 @@ class CRSPCorrectionConfig:
 
     # Minimum trading history
     min_history_filter: bool = True
-    min_trading_days: int = 252  # ~1 year of trading days
+    min_trading_days: int = 50  # ~1 year of trading days
 
     # Volume validation
     volume_validation: bool = True
@@ -120,9 +137,7 @@ class CompustatCorrectionConfig:
 
     # Industry exclusion
     industry_exclusion: bool = True
-    excluded_sic_ranges: list[tuple[int, int]] = field(
-        default_factory=lambda: [(6000, 6999)]  # Financials
-    )
+    excluded_sic_ranges: list[tuple[int, int]] = field(default_factory=lambda: [(6000, 6999)])
 
     # Book equity calculation (Fama-French hierarchy)
     book_equity_calculation: bool = True
@@ -170,10 +185,10 @@ class DerivedConfig:
     # Book-to-market ratio: BE / ME
     book_to_market: bool = True
 
-    # Operating profitability (Novy-Marx 2013): (REVT - COGS) / AT
+    # Operating profitability (FF5 / tidyfinance): (SALE - COGS - XSGA - XINT) / BE
     operating_profitability: bool = True
 
-    # Investment rate: CAPX / AT
+    # Investment rate (FF5 / tidyfinance): AT / AT_lag - 1 (asset growth)
     investment_rate: bool = True
 
 
