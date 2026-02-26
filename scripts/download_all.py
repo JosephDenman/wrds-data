@@ -49,6 +49,7 @@ from typing import Any
 from urllib.parse import quote_plus
 
 import pandas as pd
+import pyarrow.parquet as pq
 from loguru import logger
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -68,6 +69,7 @@ SKIP_SCHEMAS = frozenset({
     "pg_toast",
     "pg_temp_1",
     "pg_toast_temp_1",
+    "columnar",       # PostgreSQL/Citus internal columnar storage metadata
 })
 
 # Schemas known to be enormous (TAQ tick data can be 10+ TB).
@@ -85,6 +87,11 @@ DEFAULT_CHUNK_YEARS = 1
 
 # For tables without a usable date column, download in row-offset chunks
 ROW_CHUNK_SIZE = 5_000_000  # 5M rows per chunk
+
+# Per-query statement timeout (milliseconds). Prevents multi-hour hangs on
+# tables that are extremely slow to read (e.g., columnar metadata, huge views).
+# 30 minutes should be plenty for any single year-chunk or offset-chunk query.
+STATEMENT_TIMEOUT_MS = 30 * 60 * 1000  # 30 minutes
 
 
 # ── Size estimation ──────────────────────────────────────────────────────────
@@ -202,7 +209,10 @@ def connect(username: str, password: str) -> Engine:
         pool_pre_ping=True,
         pool_size=2,
         max_overflow=3,
-        connect_args={"connect_timeout": 30},
+        connect_args={
+            "connect_timeout": 30,
+            "options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
+        },
     )
     # Test connection
     with engine.connect() as conn:
@@ -382,6 +392,33 @@ def discover_all(
     return all_tables
 
 
+# ── Column list helpers ──────────────────────────────────────────────────────
+
+def _parquet_row_count(path: Path) -> int:
+    """Read row count from Parquet metadata without loading the file."""
+    try:
+        return pq.read_metadata(path).num_rows
+    except Exception:
+        return -1  # Corrupt or unreadable
+
+
+def _build_col_list(info: "TableInfo") -> str:
+    """Build a quoted column list from cached metadata."""
+    return ", ".join(f'"{c["name"]}"' for c in info.columns)
+
+
+def _is_column_error(exc: Exception) -> bool:
+    """Check if an exception is caused by a missing/undefined column."""
+    msg = str(exc).lower()
+    return "undefinedcolumn" in msg or "undefined column" in msg or "does not exist" in msg
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    """Check if an exception is a statement timeout cancellation."""
+    msg = str(exc).lower()
+    return "statement timeout" in msg or "querycanceled" in msg or "query canceled" in msg
+
+
 # ── Download ─────────────────────────────────────────────────────────────────
 
 def compute_year_ranges(
@@ -415,7 +452,8 @@ def download_table_with_dates(
     """
     year_ranges = compute_year_ranges(start_year, end_year, chunk_years)
     total_rows = 0
-    col_list = ", ".join(f'"{c["name"]}"' for c in info.columns)
+    col_list = _build_col_list(info)
+    use_star = False  # Fall back to SELECT * if column metadata is stale
 
     for start_yr, end_yr in year_ranges:
         if start_yr == end_yr:
@@ -426,21 +464,22 @@ def download_table_with_dates(
         output_path = output_dir / fname
         failed_marker = output_dir / f"{fname}.FAILED"
 
-        # Resume: skip existing files
+        # Resume: skip existing files (read row count from metadata, not full file)
         if output_path.exists() and not force:
-            try:
-                existing = pd.read_parquet(output_path)
-                total_rows += len(existing)
+            n = _parquet_row_count(output_path)
+            if n >= 0:
+                total_rows += n
                 continue
-            except Exception:
+            else:
                 logger.warning(f"  Corrupt file {fname}, re-downloading")
 
         # Clean up old failed marker
         if failed_marker.exists():
             failed_marker.unlink()
 
+        select_cols = "*" if use_star else col_list
         sql = f"""
-            SELECT {col_list}
+            SELECT {select_cols}
             FROM {info.fqn}
             WHERE "{info.date_column}" >= :start_date
               AND "{info.date_column}" <= :end_date
@@ -457,6 +496,31 @@ def download_table_with_dates(
                 )
                 break
             except Exception as e:
+                # If column metadata is stale (view changed), fall back to SELECT *
+                if _is_column_error(e) and not use_star:
+                    logger.warning(f"  Column metadata stale for {info.fqn}, falling back to SELECT *")
+                    use_star = True
+                    sql = f"""
+                        SELECT *
+                        FROM {info.fqn}
+                        WHERE "{info.date_column}" >= :start_date
+                          AND "{info.date_column}" <= :end_date
+                    """
+                    try:
+                        df = pd.read_sql(
+                            text(sql), engine,
+                            params={"start_date": start_date, "end_date": end_date},
+                        )
+                        break
+                    except Exception as e2:
+                        if attempt == max_retries:
+                            failed_marker.touch()
+                            logger.error(f"  FAILED {fname} after {max_retries} attempts: {e2}")
+                            return total_rows
+                        logger.warning(f"  Attempt {attempt} failed for {fname}: {e2}")
+                        time.sleep(retry_delay)
+                        continue
+
                 if attempt == max_retries:
                     failed_marker.touch()
                     logger.error(f"  FAILED {fname} after {max_retries} attempts: {e}")
@@ -480,53 +544,15 @@ def download_table_full(
     retry_delay: float = 5.0,
 ) -> int:
     """
-    Download a table without date chunking (reference/small tables).
+    Download a table without date chunking.
 
-    For very large tables without date columns, falls back to LIMIT/OFFSET
-    chunking (though this is rare in WRDS).
+    Always uses LIMIT/OFFSET chunking to avoid statement timeouts on
+    tables whose actual size doesn't match the pg_catalog estimate.
     """
-    fname = f"{info.safe_name}.parquet"
-    output_path = output_dir / fname
-    failed_marker = output_dir / f"{fname}.FAILED"
-
-    # Resume
-    if output_path.exists() and not force:
-        try:
-            existing = pd.read_parquet(output_path)
-            return len(existing)
-        except Exception:
-            logger.warning(f"  Corrupt file {fname}, re-downloading")
-
-    if failed_marker.exists():
-        failed_marker.unlink()
-
-    col_list = ", ".join(f'"{c["name"]}"' for c in info.columns)
-
-    # For tables estimated > ROW_CHUNK_SIZE, use LIMIT/OFFSET
-    if info.estimated_rows > ROW_CHUNK_SIZE:
-        return _download_table_offset_chunks(
-            engine, info, output_dir, col_list, force, max_retries, retry_delay
-        )
-
-    # Small table: single query
-    sql = f"SELECT {col_list} FROM {info.fqn}"
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            df = pd.read_sql(text(sql), engine)
-            break
-        except Exception as e:
-            if attempt == max_retries:
-                failed_marker.touch()
-                logger.error(f"  FAILED {fname} after {max_retries} attempts: {e}")
-                return 0
-            logger.warning(f"  Attempt {attempt} failed for {fname}: {e}")
-            time.sleep(retry_delay)
-
-    if len(df) > 0:
-        df.to_parquet(output_path, index=False)
-
-    return len(df)
+    col_list = _build_col_list(info)
+    return _download_table_offset_chunks(
+        engine, info, output_dir, col_list, False, force, max_retries, retry_delay
+    )
 
 
 def _download_table_offset_chunks(
@@ -534,6 +560,7 @@ def _download_table_offset_chunks(
     info: TableInfo,
     output_dir: Path,
     col_list: str,
+    use_star: bool,
     force: bool,
     max_retries: int,
     retry_delay: float,
@@ -547,26 +574,45 @@ def _download_table_offset_chunks(
         output_path = output_dir / fname
         failed_marker = output_dir / f"{fname}.FAILED"
 
-        # Resume
+        # Resume (read row count from parquet metadata, not full file)
         if output_path.exists() and not force:
-            try:
-                existing = pd.read_parquet(output_path)
-                total_rows += len(existing)
-                if len(existing) < ROW_CHUNK_SIZE:
+            n = _parquet_row_count(output_path)
+            if n >= 0:
+                total_rows += n
+                if n < ROW_CHUNK_SIZE:
                     break  # Last chunk was partial → done
                 chunk_idx += 1
                 continue
-            except Exception:
-                pass
+            else:
+                logger.warning(f"  Corrupt chunk file {fname}, re-downloading")
+                output_path.unlink()
 
         offset = chunk_idx * ROW_CHUNK_SIZE
-        sql = f"SELECT {col_list} FROM {info.fqn} LIMIT {ROW_CHUNK_SIZE} OFFSET {offset}"
+        select_cols = "*" if use_star else col_list
+        sql = f"SELECT {select_cols} FROM {info.fqn} LIMIT {ROW_CHUNK_SIZE} OFFSET {offset}"
 
+        chunk_t0 = time.time()
         for attempt in range(1, max_retries + 1):
             try:
                 df = pd.read_sql(text(sql), engine)
                 break
             except Exception as e:
+                # If column metadata is stale, fall back to SELECT *
+                if _is_column_error(e) and not use_star:
+                    logger.warning(f"  Column metadata stale for {info.fqn}, falling back to SELECT *")
+                    use_star = True
+                    sql = f"SELECT * FROM {info.fqn} LIMIT {ROW_CHUNK_SIZE} OFFSET {offset}"
+                    try:
+                        df = pd.read_sql(text(sql), engine)
+                        break
+                    except Exception as e2:
+                        if attempt == max_retries:
+                            failed_marker.touch()
+                            logger.error(f"  FAILED {fname}: {e2}")
+                            return total_rows
+                        time.sleep(retry_delay)
+                        continue
+
                 if attempt == max_retries:
                     failed_marker.touch()
                     logger.error(f"  FAILED {fname}: {e}")
@@ -578,6 +624,11 @@ def _download_table_offset_chunks(
 
         df.to_parquet(output_path, index=False)
         total_rows += len(df)
+        chunk_elapsed = time.time() - chunk_t0
+        logger.info(
+            f"    {info.fqn} chunk {chunk_idx}: {len(df):,} rows "
+            f"({chunk_elapsed:.1f}s, {total_rows:,} total so far)"
+        )
 
         if len(df) < ROW_CHUNK_SIZE:
             break  # Last chunk
@@ -638,6 +689,12 @@ def download_all_tables(
         table_dir.mkdir(parents=True, exist_ok=True)
 
         t0 = time.time()
+        est_size = format_bytes(info.estimated_bytes) if info.estimated_bytes else "unknown"
+        logger.info(
+            f"  ▶ {info.fqn} (~{info.estimated_rows:,} rows, ~{est_size}, "
+            f"{len(info.columns)} cols, "
+            f"{'date:' + info.date_column if info.date_column else 'no date col'})"
+        )
         try:
             if info.date_column:
                 # Determine chunk size based on estimated table size
@@ -690,6 +747,46 @@ def download_all_tables(
 
 
 # ── Reporting ────────────────────────────────────────────────────────────────
+
+DISCOVERY_CACHE_FILENAME = "wrds_discovery_cache.json"
+
+
+def save_discovery_cache(tables: list[TableInfo], output_path: Path) -> None:
+    """Save discovery results to a JSON cache file for fast resume."""
+    data = []
+    for t in tables:
+        data.append({
+            "schema": t.schema,
+            "table": t.table,
+            "columns": t.columns,
+            "date_column": t.date_column,
+            "estimated_rows": t.estimated_rows,
+            "accessible": t.accessible,
+            "error": t.error,
+        })
+    with open(output_path, "w") as f:
+        json.dump(data, f)
+    logger.info(f"Discovery cache saved to {output_path} ({len(data)} tables)")
+
+
+def load_discovery_cache(cache_path: Path) -> list[TableInfo]:
+    """Load discovery results from a JSON cache file."""
+    with open(cache_path) as f:
+        data = json.load(f)
+    tables = []
+    for entry in data:
+        tables.append(TableInfo(
+            schema=entry["schema"],
+            table=entry["table"],
+            columns=entry.get("columns", []),
+            date_column=entry.get("date_column"),
+            estimated_rows=entry.get("estimated_rows", 0),
+            accessible=entry.get("accessible", True),
+            error=entry.get("error", ""),
+        ))
+    logger.info(f"Loaded discovery cache: {len(tables)} tables from {cache_path}")
+    return tables
+
 
 def save_catalog(tables: list[TableInfo], output_path: Path) -> None:
     """Save discovery results as a CSV catalog."""
@@ -809,11 +906,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Only download these WRDS libraries/schemas (e.g., crsp comp ibes).",
     )
+    default_skip = [
+        # TAQ tick data (enormous, 10+ TB)
+        "taq", "taqmsec", "taqsamp", "taqsamp_all", "taqmsamp", "taqmsamp_all",
+        # Contributor datasets (niche academic datasets, ~175 GB total)
+        "contrib", "contrib_as_filed_financials", "contrib_bond_firm_link",
+        "contrib_bond_firm_link_old", "contrib_char_returns",
+        "contrib_corporate_culture", "contrib_general", "contrib_global_factor",
+        "contrib_intangible_value", "contrib_kpss", "contrib_liva",
+        # TRACE bond transaction data (~600 GB)
+        "trace", "trace_enhanced", "trace_standard", "trace_standard_old",
+    ]
     parser.add_argument(
         "--skip-libraries",
         nargs="+",
-        default=None,
-        help="Skip these libraries (e.g., taq taqmsec for tick data).",
+        default=default_skip,
+        help="Skip these libraries. Defaults to TAQ and contrib schemas. "
+             "Use --skip-libraries=none to skip nothing.",
     )
     parser.add_argument(
         "--start-year",
@@ -843,6 +952,18 @@ def parse_args() -> argparse.Namespace:
         help="Skip per-table access checks during discovery (faster but less accurate).",
     )
     parser.add_argument(
+        "--skip-discovery",
+        action="store_true",
+        help="Skip the discovery phase and load from cache. "
+             "Requires a previous run that saved wrds_discovery_cache.json "
+             "in the output directory.",
+    )
+    parser.add_argument(
+        "--rediscover",
+        action="store_true",
+        help="Force fresh discovery even if a cache exists.",
+    )
+    parser.add_argument(
         "--username",
         default=None,
         help="WRDS username (or set WRDS_USERNAME env var).",
@@ -853,7 +974,13 @@ def parse_args() -> argparse.Namespace:
         help="WRDS password (or set WRDS_PASSWORD env var).",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Allow --skip-libraries none to clear defaults
+    if args.skip_libraries and len(args.skip_libraries) == 1 and args.skip_libraries[0].lower() == "none":
+        args.skip_libraries = None
+
+    return args
 
 
 def main() -> None:
@@ -877,36 +1004,69 @@ def main() -> None:
     engine = connect(username, password)
 
     try:
-        # ── Phase 1: Discovery ───────────────────────────────────────────
-        logger.info("Phase 1: Discovering all schemas and tables...")
-
-        schemas = discover_schemas(engine, filter_libraries=args.libraries)
-
-        # Apply --skip-libraries to discovery too (not just download).
-        # Without this, schemas like taqmsec (36,000+ tables) would take
-        # hours to enumerate even if they'll be skipped during download.
-        if args.skip_libraries:
-            skip_set = {lib.lower() for lib in args.skip_libraries}
-            before = len(schemas)
-            schemas = [s for s in schemas if s not in skip_set]
-            if before != len(schemas):
-                logger.info(
-                    f"Skipping {before - len(schemas)} libraries from discovery: "
-                    f"{sorted(skip_set & {s for s in schemas} | skip_set)}"
-                )
-
-        tables = discover_all(
-            engine, schemas,
-            check_access=not args.no_access_check,
-        )
-
-        # Print summary
-        print_discovery_summary(tables)
-
-        # Save catalog
+        # ── Phase 1: Discovery (or load from cache) ──────────────────────
         catalog_dir = args.output_dir or Path(".")
         catalog_dir.mkdir(parents=True, exist_ok=True)
-        save_catalog(tables, catalog_dir / "wrds_catalog.csv")
+        cache_path = catalog_dir / DISCOVERY_CACHE_FILENAME
+
+        # Decide whether to use cache or run fresh discovery
+        use_cache = False
+        if args.skip_discovery:
+            if not cache_path.exists():
+                logger.error(
+                    f"--skip-discovery specified but no cache found at {cache_path}. "
+                    f"Run without --skip-discovery first to build the cache."
+                )
+                sys.exit(1)
+            use_cache = True
+        elif not args.rediscover and cache_path.exists() and not args.discover_only:
+            use_cache = True
+            logger.info(f"Found discovery cache at {cache_path}, skipping rediscovery. "
+                        f"Use --rediscover to force fresh discovery.")
+
+        if use_cache:
+            tables = load_discovery_cache(cache_path)
+            # Apply --skip-libraries filter to cached tables
+            if args.skip_libraries:
+                skip_set = {lib.lower() for lib in args.skip_libraries}
+                before = len(tables)
+                tables = [t for t in tables if t.schema not in skip_set]
+                if before != len(tables):
+                    logger.info(f"Filtered out {before - len(tables)} tables from skipped libraries")
+            # Apply --libraries filter to cached tables
+            if args.libraries:
+                requested = {lib.lower() for lib in args.libraries}
+                tables = [t for t in tables if t.schema in requested]
+            print_discovery_summary(tables)
+        else:
+            logger.info("Phase 1: Discovering all schemas and tables...")
+
+            schemas = discover_schemas(engine, filter_libraries=args.libraries)
+
+            # Apply --skip-libraries to discovery too (not just download).
+            # Without this, schemas like taqmsec (36,000+ tables) would take
+            # hours to enumerate even if they'll be skipped during download.
+            if args.skip_libraries:
+                skip_set = {lib.lower() for lib in args.skip_libraries}
+                before = len(schemas)
+                schemas = [s for s in schemas if s not in skip_set]
+                if before != len(schemas):
+                    logger.info(
+                        f"Skipping {before - len(schemas)} libraries from discovery: "
+                        f"{sorted(skip_set & {s for s in schemas} | skip_set)}"
+                    )
+
+            tables = discover_all(
+                engine, schemas,
+                check_access=not args.no_access_check,
+            )
+
+            # Print summary
+            print_discovery_summary(tables)
+
+            # Save discovery cache and catalog
+            save_discovery_cache(tables, cache_path)
+            save_catalog(tables, catalog_dir / "wrds_catalog.csv")
 
         if args.discover_only:
             accessible = [t for t in tables if t.accessible]
